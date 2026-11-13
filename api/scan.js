@@ -2,7 +2,8 @@
 // Body: { image: "<base64 jpeg>", mediaType: "image/jpeg" }
 // The API key lives in the GEMINI_API_KEY environment variable and never reaches the browser.
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",").map((m) => m.trim()).filter(Boolean);
 const MAX_IMAGE_CHARS = 4_000_000; // ~3 MB of base64, keeps usage and abuse down
 
 const PROMPT = `You are a careful personal-finance assistant. The image is a bank statement, card statement, or receipt.
@@ -41,39 +42,55 @@ export default async function handler(req, res) {
     return res.status(413).json({ error: "Image is too large. Try a smaller one." });
   }
 
-  try {
-    const apiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+  const body = JSON.stringify({
+    contents: [
       {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-goog-api-key": process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { inline_data: { mime_type: mediaType, data: image } },
-                { text: PROMPT },
-              ],
-            },
-          ],
-          generationConfig: {
-            responseMimeType: "application/json",
-            maxOutputTokens: 4000,
-            temperature: 0.2,
-          },
-        }),
-      }
-    );
+        parts: [
+          { inline_data: { mime_type: mediaType, data: image } },
+          { text: PROMPT },
+        ],
+      },
+    ],
+    generationConfig: {
+      responseMimeType: "application/json",
+      maxOutputTokens: 4000,
+      temperature: 0.2,
+    },
+  });
 
-    const data = await apiRes.json();
+  // Try the main model first. If Google is busy (503) or the model is unavailable (404),
+  // wait a moment and move on to the next model in the list.
+  const models = [MODEL, ...FALLBACK_MODELS.filter((m) => m !== MODEL)];
+
+  try {
+    let apiRes, data;
+    for (let i = 0; i < models.length; i++) {
+      apiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${models[i]}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-goog-api-key": process.env.GEMINI_API_KEY,
+          },
+          body,
+        }
+      );
+      data = await apiRes.json();
+      if (apiRes.ok) break;
+      console.error("Gemini error", models[i], JSON.stringify(data));
+      const retryable = [404, 429, 500, 503].includes(apiRes.status);
+      if (!retryable) break;
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
     if (apiRes.status === 429) {
       return res.status(429).json({ error: "Too many scans right now (free-tier limit). Wait a minute and try again." });
     }
+    if (apiRes.status === 503) {
+      return res.status(503).json({ error: "Google's AI is busy right now. Please try again in a minute." });
+    }
     if (!apiRes.ok) {
-      console.error("Gemini error", JSON.stringify(data));
       return res.status(502).json({ error: "The AI service returned an error. Try again." });
     }
 
